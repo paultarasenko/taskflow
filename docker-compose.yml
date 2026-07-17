@@ -1,0 +1,87 @@
+# Локальное окружение разработки. Одна команда после клонирования:
+#   cp .env.example .env && docker compose up --build
+#
+# Сервисов ровно четыре (api, frontend, postgres, redis) — сознательно без
+# Celery worker: AI-слой (единственный потребитель очереди) реализуется на
+# Этапе 10, и держать в compose пустой воркер без единой задачи для него —
+# лишняя сущность до тех пор, пока ему нечего делать (см. docs/01-architecture-and-design.md,
+# 6.1). Появится вместе с AI-функциональностью, не раньше.
+#
+# `version:` не указан намеренно — ключ объявлен legacy в Compose Specification,
+# современный `docker compose` (v2, Compose V2 CLI plugin) его игнорирует.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    env_file: .env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    networks: [taskflow-net]
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    networks: [taskflow-net]
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      # Переопределяем localhost-значения из .env.example: внутри docker-сети
+      # сервисы адресуются по имени сервиса (postgres/redis), не localhost.
+      # .env остаётся источником правды для локального (не-docker) запуска
+      # backend/README.md — эти два переопределения нужны только здесь.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    networks: [taskflow-net]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000/api/v1}
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks: [taskflow-net]
+
+networks:
+  taskflow-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
