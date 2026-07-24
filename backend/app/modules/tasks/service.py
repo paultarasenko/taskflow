@@ -1,6 +1,8 @@
 """Бизнес-логика модуля `tasks`."""
 
+import logging
 from collections.abc import Sequence
+from typing import Any
 from uuid import UUID
 
 from app.core.exceptions import (
@@ -19,11 +21,15 @@ from app.modules.tasks.repository import (
     PostgresTaskAssigneeRepository,
     PostgresTaskRepository,
 )
-from app.modules.tasks.schema import TaskCreate, TaskUpdate
+from app.modules.tasks.schema import TaskCreate, TaskRead, TaskUpdate
 from app.modules.users.model import User
+from app.modules.websocket.connection_manager import ConnectionManager
+from app.modules.websocket.schema import WSEvent, WSEventType
 from app.modules.workspace.repository import PostgresWorkspaceMemberRepository
 
 DEFAULT_COLUMN_NAMES = ["Ideas", "Development", "Testing", "Done"]
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_status_transition(current: TaskStatus, new: TaskStatus) -> None:
@@ -49,6 +55,7 @@ class TaskService:
         workspace_member_repository: PostgresWorkspaceMemberRepository,
         assignee_repository: PostgresTaskAssigneeRepository,
         notification_service: NotificationService,
+        connection_manager: ConnectionManager,
     ) -> None:
         self._tasks = task_repository
         self._boards = board_repository
@@ -57,6 +64,21 @@ class TaskService:
         self._workspace_members = workspace_member_repository
         self._assignees = assignee_repository
         self._notifications = notification_service
+        self._connections = connection_manager
+
+    async def _publish(
+        self, project_id: UUID, event_type: WSEventType, payload: dict[str, Any]
+    ) -> None:
+        """Единая точка публикации — раздел 5.10, комната = project_id.
+        Ошибка Redis не должна ронять бизнес-операцию (задача уже сохранена
+        в БД к этому моменту): realtime — дополнительный канал уведомления,
+        не источник истины.
+        """
+        event = WSEvent(type=event_type, payload=payload)
+        try:
+            await self._connections.publish(project_id, event.model_dump_json())
+        except Exception:  # noqa: BLE001 — публикация в WS не должна ломать API-ответ
+            logger.warning("Не удалось опубликовать WS-событие %s", event_type, exc_info=True)
 
     async def _require_project_access(self, project_id: UUID, user: User) -> None:
         """Тот же паттерн, что в ProjectService._require_workspace_membership —
@@ -107,7 +129,13 @@ class TaskService:
             due_date=data.due_date,
             status=TaskStatus.TODO,
         )
-        return await self._tasks.add(task)
+        created = await self._tasks.add(task)
+        await self._publish(
+            data.project_id,
+            WSEventType.TASK_CREATED,
+            TaskRead.model_validate(created).model_dump(mode="json"),
+        )
+        return created
 
     async def get_by_id(self, task_id: UUID, current_user: User) -> Task:
         task = await self._tasks.get_by_id(task_id)
@@ -144,14 +172,22 @@ class TaskService:
             task.priority = data.priority
         if data.due_date is not None:
             task.due_date = data.due_date
+        is_move = data.column_id is not None
         if data.column_id is not None:
             task.column_id = data.column_id
 
-        return await self._tasks.save(task)
+        saved = await self._tasks.save(task)
+        event_type = WSEventType.TASK_MOVED if is_move else WSEventType.TASK_UPDATED
+        await self._publish(
+            saved.project_id, event_type, TaskRead.model_validate(saved).model_dump(mode="json")
+        )
+        return saved
 
     async def delete(self, task_id: UUID, current_user: User) -> None:
         task = await self.get_by_id(task_id, current_user)
+        project_id = task.project_id
         await self._tasks.delete(task)
+        await self._publish(project_id, WSEventType.TASK_DELETED, {"id": str(task_id)})
 
     async def assign_user(
         self, task_id: UUID, assignee_user_id: UUID, current_user: User
@@ -185,4 +221,9 @@ class TaskService:
             TaskAssignee(task_id=task_id, user_id=assignee_user_id)
         )
         await self._notifications.notify_task_assigned(assignee_user_id, task_id)
+        await self._publish(
+            task.project_id,
+            WSEventType.NOTIFICATION_CREATED,
+            {"user_id": str(assignee_user_id), "type": "assigned", "related_task_id": str(task_id)},
+        )
         return assignment

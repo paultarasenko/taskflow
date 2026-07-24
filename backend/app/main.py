@@ -6,6 +6,9 @@
 логика подключается по мере готовности модулей на следующих этапах.
 """
 
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,6 +16,7 @@ from sqlalchemy import text
 
 from app.core.config import get_settings
 from app.core.exceptions import AppError, ProblemDetail
+from app.core.redis import close_redis, redis_client
 
 # Импорт до роутеров: гарантирует, что SQLAlchemy registry знает обо всех
 # моделях до первого запроса — иначе строковые relationship-таргеты
@@ -34,11 +38,18 @@ from app.modules.workspace.router import router as workspace_router
 settings = get_settings()
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    yield
+    await close_redis()
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         debug=settings.debug,
         docs_url="/docs",
+        lifespan=lifespan,
     )
 
     app.add_middleware(
@@ -66,8 +77,6 @@ def create_app() -> FastAPI:
 
     @app.get("/health/ready", tags=["health"], response_model=None)
     async def health_ready() -> dict[str, str] | JSONResponse:
-        # Redis-проверка не входит в Этап 4 (Database layer) — Redis
-        # используется реально только с Этапа 8 (realtime). Добавится тогда.
         try:
             async with engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))
@@ -76,6 +85,15 @@ def create_app() -> FastAPI:
                 status_code=503,
                 content={"status": "unavailable", "detail": f"database: {exc}"},
             )
+
+        try:
+            await redis_client.ping()
+        except Exception as exc:  # noqa: BLE001 — health-check обязан пережить любую ошибку Redis
+            return JSONResponse(
+                status_code=503,
+                content={"status": "unavailable", "detail": f"redis: {exc}"},
+            )
+
         return {"status": "ok"}
 
     api_prefix = settings.api_v1_prefix

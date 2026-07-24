@@ -3,7 +3,7 @@
 Современная система управления задачами (Kanban, realtime, AI-ассистент) —
 портфолио-проект, демонстрирующий production-подход к архитектуре на Python/FastAPI + React.
 
-> **Статус: Этап 7 из 13 — Comments + Notifications REST API.**
+> **Статус: Этап 8 из 13 — Realtime (WebSocket + Redis Pub/Sub).**
 > Это техническая заглушка README. Полная версия — с описанием продукта,
 > скриншотами, GIF-демо и roadmap — появится на Этапе 13 (см.
 > [`docs/01-architecture-and-design.md`](docs/01-architecture-and-design.md), раздел 6).
@@ -98,12 +98,34 @@ Alembic-миграции используют отдельные `taskflow_test`
 создаёт обе БД перед прогоном тестов — локально это нужно сделать один раз
 вручную, аналогично `taskflow`.
 
+## Realtime (WebSocket)
+
+`WSS /api/v1/ws/projects/{project_id}?token=<jwt>` (без `/api/v1`-префикса
+в реальности — WS-роут подключён отдельно от HTTP-роутеров, см.
+`app/main.py`). Локально нужен Redis:
+
+```bash
+redis-server --daemonize yes  # или через docker compose (сервис уже есть)
+```
+
+События: `task.created/updated/moved/deleted`, `comment.created`,
+`notification.created` — публикуются из `TaskService`/`CommentService` при
+изменениях (см. ADR-0008). `member.online/offline` — не реализованы
+(Roadmap).
+
+**Тестирование WebSocket** — отдельная история: обычная транзакционная
+`db_session`, которой пользуются все остальные тесты, не работает для WS
+(WS-тесты идут через `TestClient`, который поднимает приложение в другом
+потоке/event loop). `tests/modules/test_websocket.py` использует отдельный
+engine с `NullPool` — подробное объяснение прямо в докстринге файла и в
+ADR-0008.
+
 ## CI/CD
 
-`.github/workflows/ci.yml`: backend (создание тестовых БД → ruff → black →
-mypy → pytest → alembic upgrade head → seed idempotency check), frontend
-(lint → build), затем сборка обоих Docker-образов для верификации. Деплоя
-пока нет — это Этап 12.
+`.github/workflows/ci.yml`: backend (Postgres + Redis service-контейнеры →
+создание тестовых БД → ruff → black → mypy → pytest → alembic upgrade head
+→ seed idempotency check), frontend (lint → build), затем сборка обоих
+Docker-образов для верификации. Деплоя пока нет — это Этап 12.
 
 ## Стек
 

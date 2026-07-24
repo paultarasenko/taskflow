@@ -454,6 +454,14 @@ erDiagram
 События (server → client): `task.created`, `task.updated`, `task.moved`, `task.deleted`, `comment.created`, `notification.created`, `member.online` / `member.offline`.
 Транспорт fan-out между инстансами API — Redis Pub/Sub канал `project:{id}`, что позволяет держать несколько реплик backend за балансировщиком без sticky sessions.
 
+**Реализовано на Этапе 8**: `task.created/updated/moved/deleted`, `comment.created`,
+`notification.created` — публикуются из `TaskService`/`CommentService` (см.
+ADR-0008). `member.online`/`member.offline` — не реализованы: presence
+(кто сейчас смотрит доску) не запрашивался явно и не имеет пока
+потребителя на фронтенде (Этап 9). `notification.created` — известное
+ограничение: публикуется в комнату проекта, не персонально пользователю
+(WS-контракт комнатный, не per-user) — подробности в ADR-0008.
+
 ### 5.11 Аутентификация запросов
 `Authorization: Bearer <access_jwt>`, access-токен живёт 15 мин, refresh — 30 дней (хранится как httpOnly secure cookie для веб-клиента). Все mutating-эндпоинты защищены RBAC-проверкой на уровне сервиса (не только роутера) — на случай, если сервис вызывается не из HTTP-слоя (например, из Celery-таски).
 
@@ -624,6 +632,7 @@ docker compose up
 | `0005-ai-provider-abstraction.md` | Adapter Pattern для AI-провайдеров, один провайдер в MVP |
 | `0006-repository-and-session-lifecycle.md` | Generic BaseRepository + session-per-request auto-commit (Этап 4) |
 | `0007-invitation-flow.md` | Invitation — токен-based приглашения с вычисляемым статусом (Этап 6) |
+| `0008-websocket-realtime.md` | WebSocket-аутентификация, ConnectionManager поверх Redis Pub/Sub (Этап 8) |
 
 Формат единый для всех: Статус → Контекст → Решение → Последствия. Новый ADR заводится, когда решение (а) не тривиально, (б) могло бы быть принято иначе, (в) стоит денег/времени, если его придётся откатывать позже — не под каждый мелкий выбор библиотеки.
 

@@ -36,6 +36,7 @@ from app.modules.tasks.service import TaskService
 from app.modules.users.model import User
 from app.modules.users.repository import PostgresUserRepository
 from app.modules.users.service import UserService
+from app.modules.websocket.connection_manager import ConnectionManager, connection_manager
 from app.modules.workspace.model import WorkspaceMember
 from app.modules.workspace.repository import (
     PostgresInvitationRepository,
@@ -167,12 +168,24 @@ def get_notification_service(
 NotificationServiceDep = Annotated[NotificationService, Depends(get_notification_service)]
 
 
+def get_connection_manager() -> ConnectionManager:
+    """Не создаёт новый экземпляр — `connection_manager` держит живое
+    состояние (активные WS-соединения) на весь процесс, см.
+    websocket/connection_manager.py.
+    """
+    return connection_manager
+
+
+ConnectionManagerDep = Annotated[ConnectionManager, Depends(get_connection_manager)]
+
+
 def get_comment_service(
     comment_repository: CommentRepositoryDep,
     task_repository: TaskRepositoryDep,
     project_repository: ProjectRepositoryDep,
     workspace_member_repository: WorkspaceMemberRepositoryDep,
     notification_service: NotificationServiceDep,
+    connection_manager: ConnectionManagerDep,
 ) -> CommentService:
     return CommentService(
         comment_repository,
@@ -180,6 +193,7 @@ def get_comment_service(
         project_repository,
         workspace_member_repository,
         notification_service,
+        connection_manager,
     )
 
 
@@ -208,6 +222,7 @@ def get_task_service(
     workspace_member_repository: WorkspaceMemberRepositoryDep,
     assignee_repository: TaskAssigneeRepositoryDep,
     notification_service: NotificationServiceDep,
+    connection_manager: ConnectionManagerDep,
 ) -> TaskService:
     return TaskService(
         task_repository,
@@ -217,6 +232,7 @@ def get_task_service(
         workspace_member_repository,
         assignee_repository,
         notification_service,
+        connection_manager,
     )
 
 
@@ -262,6 +278,28 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def get_current_user_ws(token: str, user_repository: PostgresUserRepository) -> User:
+    """WS-аналог `get_current_user`: токен приходит query-параметром
+    (`?token=...`), не заголовком — у WebSocket handshake нет тела/заголовков
+    в привычном REST-смысле, а contract (`WSS /ws/projects/{id}?token=<jwt>`,
+    раздел 5.10) фиксирует именно query. Вызывается явно внутри
+    `websocket/router.py`, а не через `Depends()`, потому что при ошибке
+    здесь нужно закрыть WS-соединение (`websocket.close(code=1008)`), а не
+    вернуть JSONResponse через `AppError`-обработчик (тот применяется только
+    к HTTP-роутам, WebSocket его не проходит).
+    """
+    payload = decode_token(token, expected_type="access")
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise UnauthorizedError("Токен не содержит идентификатора пользователя")
+
+    user = await user_repository.get_by_id(UUID(user_id))
+    if user is None or not user.is_active:
+        raise UnauthorizedError("Пользователь не найден или деактивирован")
+
+    return user
 
 
 # --- Workspace membership (RBAC foundation) ---

@@ -14,7 +14,8 @@ jobs:
       run:
         working-directory: backend
     # Postgres нужен реально: Этап 4 добавил repository/alembic/connection
-    # тесты, которые бьют в настоящую БД, а не моки. Без сервиса здесь
+    # тесты, которые бьют в настоящую БД, а не моки. Redis — Этап 8
+    # добавил WebSocket-тесты с реальным Pub/Sub. Без обоих сервисов здесь
     # `pytest` упадёт на CI ровно так же, как упал бы без Docker locally.
     services:
       postgres:
@@ -30,8 +31,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       DATABASE_URL: postgresql+asyncpg://taskflow:taskflow@localhost:5432/taskflow
+      REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
 
