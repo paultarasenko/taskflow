@@ -1,37 +1,18 @@
 """Integration-тесты WebSocket + Redis Pub/Sub.
 
-Starlette `TestClient` (не `httpx.AsyncClient` — тот WS не поддерживает)
-запускает ASGI-приложение в отдельном потоке со своим event loop.
+Starlette TestClient (httpx.AsyncClient WS не поддерживает) запускает
+ASGI-приложение в отдельном потоке со своим event loop.
 
-## Найденная и исправленная проблема: cross-event-loop соединения
+Обычный (пуловый) db_session тут не работает: asyncpg-соединения в пуле
+привязаны к loop, в котором были созданы, и падают с RuntimeError при
+переиспользовании из другого loop. Поэтому ниже — отдельный engine с
+NullPool: он не кэширует соединения, каждый checkout создаёт новое и
+сразу его закрывает.
 
-Первая попытка — переиспользовать транзакционную `db_session` (как в
-остальных тестах, см. conftest.py) — падала с `RuntimeError: ... attached
-to a different loop`: AsyncSession, открытая в loop основного теста,
-недоступна из loop TestClient-потока.
-
-Вторая попытка — обычный (не переопределённый) клиент на реальный
-`app.database.session.engine`, с explicit `engine.dispose()` после каждого
-WS-блока — тоже падала с той же ошибкой, только на моменте `dispose()`:
-пул всё равно пытался закрыть asyncpg-соединение, физически созданное в
-loop TestClient-потока, из loop основного теста. `dispose()` не устраняет
-причину, только двигает момент её проявления.
-
-Корневая причина: SQLAlchemy `AsyncAdaptedQueuePool` кэширует живые
-asyncpg-соединения между чекаутами, и каждое такое соединение жёстко
-привязано к тому event loop, в котором было создано. Как только на одно и
-то же соединение (через общий `engine`) претендуют два разных loop'а —
-любая попытка закрыть/переиспользовать его из "чужого" loop падает.
-
-**Рабочее решение**: отдельный engine с `NullPool` (`_ws_null_pool_engine`
-ниже) — NullPool вообще не кэширует соединения: каждый checkout создаёт
-новое asyncpg-соединение с нуля в _текущем_ loop и закрывает его сразу по
-возврату. Соединение никогда не переживает границу вызова, поэтому вопрос
-"из какого it loop его закрывать" не возникает в принципе. Через
-`app.dependency_overrides[get_db_session]` эта версия подставляется вместо
-обычной (пуловой) на время файла — и HTTP-вызовы через `raw_client`
-(основной loop), и WS через `TestClient` (loop потока) используют её
-одинаково безопасно.
+Баг из первой версии файла: движок был на database_url() (основная БД),
+а не на taskflow_test. Локально работало, потому что alembic накатывался
+руками, а в CI pytest идёт раньше alembic upgrade — падало с
+UndefinedTableError. Исправлено на _test_database_url() из conftest.py.
 """
 
 import asyncio
@@ -39,7 +20,6 @@ import uuid
 from collections.abc import AsyncGenerator
 
 import pytest
-from app.core.config import get_settings
 from app.core.dependencies import get_db_session
 from app.main import app
 from httpx import ASGITransport, AsyncClient
@@ -47,10 +27,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 from starlette.testclient import TestClient
 
-# NullPool — намеренно, см. докстринг модуля. Engine-объект сам по себе (в
-# отличие от пула с кэшем живых соединений) не хранит loop-специфичного
-# состояния, поэтому безопасно создать один раз на модуль.
-_ws_null_pool_engine = create_async_engine(get_settings().database_url, poolclass=NullPool)
+from tests.conftest import _test_database_url
+
+# NullPool — см. докстринг. URL — taskflow_test, не основная БД.
+_ws_null_pool_engine = create_async_engine(_test_database_url(), poolclass=NullPool)
 _ws_session_factory = async_sessionmaker(_ws_null_pool_engine, expire_on_commit=False)
 
 
@@ -66,11 +46,7 @@ async def _ws_override_get_db_session() -> AsyncGenerator[AsyncSession, None]:
 
 @pytest.fixture(autouse=True)
 def _use_null_pool_session() -> AsyncGenerator[None, None]:
-    """Переопределяем `get_db_session` для всех тестов этого файла — и
-    HTTP-вызовы, и WS должны идти через NullPool-версию, иначе одна половина
-    трафика будет на обычном (пуловом) engine, что возвращает исходную
-    проблему наполовину.
-    """
+    """Переопределяем get_db_session — и HTTP, и WS должны идти через NullPool-версию."""
     app.dependency_overrides[get_db_session] = _ws_override_get_db_session
     yield
     app.dependency_overrides.pop(get_db_session, None)
